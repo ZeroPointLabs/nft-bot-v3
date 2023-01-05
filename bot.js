@@ -118,68 +118,104 @@ const WEB3_PROVIDER_URLS = process.env.WSS_URLS.split(",");
 let currentWeb3ClientBlocks = new Array(WEB3_PROVIDER_URLS.length).fill(0);
 let currentL1Blocks = new Array(WEB3_PROVIDER_URLS.length).fill(0), prevL1BlockFetchTimeMs = 0;
 
-async function setCurrentWeb3Client(newWeb3ClientIndex){
-	appLogger.info("Switching web3 client to " + WEB3_PROVIDER_URLS[newWeb3ClientIndex] + " (#" + newWeb3ClientIndex + ")...");
+let pendingWeb3ClientSwitchPromise = null;
 
-	const executionStartTime = performance.now();
-	const newWeb3Client = web3Clients[newWeb3ClientIndex];
+async function switchCurrentWeb3Client(newWeb3ClientIndex){
+	// If this client is already the current client we either wait on the pending switch or just return
+	if(currentlySelectedWeb3ClientIndex === newWeb3ClientIndex) {
+		if(pendingWeb3ClientSwitchPromise !== null) {
+			appLogger.warn(`Already in process of switching to web3 client ${WEB3_PROVIDER_URLS[newWeb3ClientIndex]} (#${newWeb3ClientIndex}); will just await that...`);
 
-	storageContract = new newWeb3Client.eth.Contract(abis.STORAGE, process.env.STORAGE_ADDRESS);
+			await pendingWeb3ClientSwitchPromise;
+		} else {
+			appLogger.warn(`Already using web3 client ${WEB3_PROVIDER_URLS[newWeb3ClientIndex]} (#${newWeb3ClientIndex}); request to switch ignored.`);
+		}
 
-	// Retrieve all necessary details from the storage contract
-	const [
-		aggregatorAddress,
-		callbacksAddress,
-		tradingAddress,
-		vaultAddress,
-		linkAddress
-	] = await Promise.all([
-		storageContract.methods.priceAggregator().call(),
-		storageContract.methods.callbacks().call(),
-		storageContract.methods.trading().call(),
-		storageContract.methods.vault().call(),
-		storageContract.methods.linkErc677().call()
-	]);
+		return;
+	}
+
+	try {
+		pendingWeb3ClientSwitchPromise = executeWeb3ClientSwitch();
+
+		await pendingWeb3ClientSwitchPromise;
+	} finally {
+		pendingWeb3ClientSwitchPromise = null;
+	}
+
+	async function executeWeb3ClientSwitch() {
+		appLogger.info("Switching web3 client to " + WEB3_PROVIDER_URLS[newWeb3ClientIndex] + " (#" + newWeb3ClientIndex + ")...");
+
+		const executionStartTime = performance.now();
+		const newWeb3Client = web3Clients[newWeb3ClientIndex];
+
+		const previouslySelectedWeb3ClientIndex = currentlySelectedWeb3ClientIndex;
+		const previouslySelectedWeb3Client = currentlySelectedWeb3Client;
+
+		// Update the globally selected provider with this new provider
+		currentlySelectedWeb3ClientIndex = newWeb3ClientIndex;
+		currentlySelectedWeb3Client = newWeb3Client;
+
+		try {
+			storageContract = new newWeb3Client.eth.Contract(abis.STORAGE, process.env.STORAGE_ADDRESS);
+
+			// Retrieve all necessary details from the storage contract
+			const [
+				aggregatorAddress,
+				callbacksAddress,
+				tradingAddress,
+				vaultAddress,
+				linkAddress
+			] = await Promise.all([
+				storageContract.methods.priceAggregator().call(),
+				storageContract.methods.callbacks().call(),
+				storageContract.methods.trading().call(),
+				storageContract.methods.vault().call(),
+				storageContract.methods.linkErc677().call()
+			]);
 
 
-	callbacksContract = new newWeb3Client.eth.Contract(abis.CALLBACKS, callbacksAddress);
-	tradingContract = new newWeb3Client.eth.Contract(abis.TRADING, tradingAddress);
-	vaultContract = new newWeb3Client.eth.Contract(abis.VAULT, vaultAddress);
-	pairInfosContract = new newWeb3Client.eth.Contract(abis.PAIR_INFOS, process.env.PAIR_INFOS_ADDRESS);
+			callbacksContract = new newWeb3Client.eth.Contract(abis.CALLBACKS, callbacksAddress);
+			tradingContract = new newWeb3Client.eth.Contract(abis.TRADING, tradingAddress);
+			vaultContract = new newWeb3Client.eth.Contract(abis.VAULT, vaultAddress);
+			pairInfosContract = new newWeb3Client.eth.Contract(abis.PAIR_INFOS, process.env.PAIR_INFOS_ADDRESS);
 
-	const aggregatorContract = new newWeb3Client.eth.Contract(abis.AGGREGATOR, aggregatorAddress);
+			const aggregatorContract = new newWeb3Client.eth.Contract(abis.AGGREGATOR, aggregatorAddress);
 
-	const [
-		pairsStorageAddress,
-		nftRewardsAddress
-	 ] = await Promise.all([
-		aggregatorContract.methods.pairsStorage().call(),
-		callbacksContract.methods.nftRewards().call()
-	 ]);
+			const [
+				pairsStorageAddress,
+				nftRewardsAddress
+			] = await Promise.all([
+				aggregatorContract.methods.pairsStorage().call(),
+				callbacksContract.methods.nftRewards().call()
+			]);
 
-	pairsStorageContract = new newWeb3Client.eth.Contract(abis.PAIRS_STORAGE, pairsStorageAddress);
-	nftRewardsContract = new newWeb3Client.eth.Contract(abis.NFT_REWARDS, nftRewardsAddress);
+			pairsStorageContract = new newWeb3Client.eth.Contract(abis.PAIRS_STORAGE, pairsStorageAddress);
+			nftRewardsContract = new newWeb3Client.eth.Contract(abis.NFT_REWARDS, nftRewardsAddress);
 
-	linkContract = new newWeb3Client.eth.Contract(abis.LINK, linkAddress);
+			linkContract = new newWeb3Client.eth.Contract(abis.LINK, linkAddress);
 
-	// Update the globally selected provider with this new provider
-	currentlySelectedWeb3ClientIndex = newWeb3ClientIndex;
-	currentlySelectedWeb3Client = newWeb3Client;
+			// Subscribe to events using the new provider
+			watchLiveTradingEvents();
 
-	// Subscribe to events using the new provider
-	watchLiveTradingEvents();
+			await Promise.all([
+				nftManager.loadNfts(),
+				nonceManager.initialize()
+			]);
 
-	await Promise.all([
-		nftManager.loadNfts(),
-		nonceManager.initialize()
-	]);
+			// Fire and forget refreshing of data using new provider
+			fetchTradingVariables();
+			fetchOpenTrades();
+			checkLinkAllowance();
 
-	// Fire and forget refreshing of data using new provider
-	fetchTradingVariables();
-	fetchOpenTrades();
-	checkLinkAllowance();
+			appLogger.info("New web3 client selection completed. Took: " + (performance.now() - executionStartTime) + "ms");
+		} catch(error) {
+			appLogger.error("Error while switching web3 client!", { error });
 
-	appLogger.info("New web3 client selection completed. Took: " + (performance.now() - executionStartTime) + "ms");
+			// Revert back to the previous provider!!!
+			currentlySelectedWeb3ClientIndex = previouslySelectedWeb3ClientIndex;
+			currentlySelectedWeb3Client = previouslySelectedWeb3Client;
+		}
+	}
 }
 
 function createWeb3Provider(providerUrl) {
@@ -243,34 +279,43 @@ function createWeb3Client(providerIndex, providerUrl) {
 
 		currentWeb3ClientBlocks[providerIndex] = newBlockNumber;
 
-		if (l1BlockFetchIntervalMs !== undefined && Date.now() - prevL1BlockFetchTimeMs > l1BlockFetchIntervalMs) {			
-			prevL1BlockFetchTimeMs = Date.now();
-			try {
-				const block = await web3Client.eth.getBlock(newBlockNumber);
-				const _currentL1BlockNumber = Web3.utils.hexToNumber(block.l1BlockNumber);
-				if (currentL1Blocks[providerIndex] !== _currentL1BlockNumber) {
-					currentL1Blocks[providerIndex] = _currentL1BlockNumber;
-					appLogger.debug(`New L1 block received ${_currentL1BlockNumber} from provider ${providerUrl}...`);
-				}
-			} catch (error) {
-				appLogger.error(`An error occurred attempting to fetch L1 block number for block ${newBlockNumber}`, { blockNumber: newBlockNumber, error });
-			}
-		}
-
 		appLogger.debug(`New block received ${newBlockNumber} from provider ${providerUrl}...`);
 
+		// If this is already the currently selected provider then we don't need to do anything else
 		if(currentlySelectedWeb3ClientIndex === providerIndex) {
 			return;
 		}
 
+		// Check if this provider's block is more recent than the currently selected provider's block by the max drift
+		// and, if so, switch now
 		const blockDiff = currentlySelectedWeb3ClientIndex === -1 ? newBlockNumber : newBlockNumber - currentWeb3ClientBlocks[currentlySelectedWeb3ClientIndex];
 
-		// Check if this block is more recent than the currently selected provider's block by the max drift
-		// and, if so, switch now
 		if(blockDiff > MAX_PROVIDER_BLOCK_DRIFT) {
 			appLogger.info(`Switching to provider ${providerUrl} #${providerIndex} because it is ${blockDiff} block(s) ahead of current provider (${newBlockNumber} vs ${currentWeb3ClientBlocks[currentlySelectedWeb3ClientIndex]})`);
 
-			setCurrentWeb3Client(providerIndex);
+			await switchCurrentWeb3Client(providerIndex);
+		}
+
+		// Always fetch the latest L1 block number if it's time
+		await fetchLatestL1BlockNumberIfTime();
+
+		async function fetchLatestL1BlockNumberIfTime() {
+			if (l1BlockFetchIntervalMs !== undefined && Date.now() - prevL1BlockFetchTimeMs > l1BlockFetchIntervalMs) {
+				prevL1BlockFetchTimeMs = Date.now();
+				try {
+					const latestBlock = await web3Client.eth.getBlock(newBlockNumber);
+					const _currentL1BlockNumber = Web3.utils.hexToNumber(latestBlock.l1BlockNumber);
+
+					// If the L1 block number has changed then update it now
+					if (currentL1Blocks[providerIndex] !== _currentL1BlockNumber) {
+						currentL1Blocks[providerIndex] = _currentL1BlockNumber;
+
+						appLogger.debug(`New L1 block received ${_currentL1BlockNumber} from provider ${providerUrl}...`);
+					}
+				} catch (error) {
+					appLogger.error(`An error occurred attempting to fetch L1 block number for block ${newBlockNumber}`, { blockNumber: newBlockNumber, error });
+				}
+			}
 		}
 	});
 
@@ -1340,7 +1385,7 @@ function watchPricingStream() {
 			const { accPerOiLong, accPerOiShort, lastUpdateBlock } = pairFundingFees[pairIndex];
 			const { fundingFeePerBlockP } = pairParams[pairIndex];
 			const { long: longOi, short: shortOi } = openInterests[pairIndex];
-			
+
 			const currentBlock = l1BlockFetchIntervalMs !== undefined ? currentL1Blocks[currentlySelectedWeb3ClientIndex] : currentWeb3ClientBlocks[currentlySelectedWeb3ClientIndex];
 			const fundingFeesPaidByLongs = (longOi - shortOi) * fundingFeePerBlockP * (currentBlock - lastUpdateBlock);
 
